@@ -2,8 +2,10 @@ streamlit
 pandas
 numpy
 scikit-learn
-matplotlib
-seaborn
 shap
 lime
+xgboost
+matplotlib
+seaborn
 faker
+openpyxl
