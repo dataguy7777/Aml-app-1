@@ -20,6 +20,7 @@ from sklearn.metrics import (
 )
 import shap
 from lime.lime_tabular import LimeTabularExplainer
+from sklearn.preprocessing import LabelEncoder
 from faker import Faker
 import warnings
 import xgboost as xgb
@@ -99,10 +100,10 @@ def load_data(uploaded_file, num_samples=1000):
         df = generate_data(num_samples)
     return df
 
-# Preprocess data function
+# Preprocess data function with Label Encoding
 def preprocess_data(df, target_column, selected_features=None):
     """
-    Preprocess the dataset by dropping unnecessary columns and one-hot encoding categorical variables.
+    Preprocess the dataset by dropping unnecessary columns and applying Label Encoding to categorical variables.
 
     Args:
         df (pd.DataFrame): The input dataframe.
@@ -125,8 +126,17 @@ def preprocess_data(df, target_column, selected_features=None):
     drop_cols = set(df.columns) - set(selected_features) - {target_column}
     features = df.drop(columns=drop_cols)
 
-    # One-hot encode categorical variables
-    X = pd.get_dummies(features, drop_first=True)
+    # Identify categorical columns
+    categorical_cols = features.select_dtypes(include=['object', 'bool']).columns.tolist()
+
+    # Apply Label Encoding to categorical columns
+    label_encoders = {}
+    for col in categorical_cols:
+        le = LabelEncoder()
+        features[col] = le.fit_transform(features[col])
+        label_encoders[col] = le  # Store the encoder if needed later
+
+    X = features
     y = df[target_column].astype(int)
 
     return X, y
@@ -188,7 +198,7 @@ def main():
     st.set_page_config(page_title="AML Detection - SGR", layout="wide")
 
     st.sidebar.title("AML Detection Dashboard")
-    tabs = ["Data Overview", "Variable Selection", "Model Training", "Model Evaluation", "Explainability"]
+    tabs = ["Data Overview", "Transformation and Selection", "Model Training", "Model Evaluation", "Explainability"]
     selected_tab = st.sidebar.radio("Navigate to", tabs)
 
     # File uploader
@@ -205,13 +215,14 @@ def main():
     else:
         st.sidebar.info("No file uploaded. Using generated data.")
 
-    # Variable Selection
-    if selected_tab == "Variable Selection":
-        st.title("Variable Selection")
+    # Transformation and Selection
+    if selected_tab == "Transformation and Selection":
+        st.title("Transformation and Selection")
 
         # Preprocess data without variable selection to get all features
         X_all, y = preprocess_data(df, target)
 
+        # Multiselect for feature selection
         selected_features = st.multiselect(
             "Select Features to Include",
             options=X_all.columns.tolist(),
@@ -227,6 +238,29 @@ def main():
             # Show selected features
             st.subheader("Selected Features")
             st.write(selected_features)
+
+            # Apply Feature Importance using XGBoost to suggest relevant features
+            st.subheader("Feature Importance using XGBoost")
+            if 'X_train' in st.session_state and 'models' in st.session_state:
+                model = st.session_state['models'].get('XGBoost')
+                if model:
+                    importances = model.feature_importances_
+                    feature_importance_df = pd.DataFrame({
+                        'Feature': X_all.columns,
+                        'Importance': importances
+                    }).sort_values(by='Importance', ascending=False)
+
+                    st.write(feature_importance_df)
+
+                    # Plot Feature Importances
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    sns.barplot(x='Importance', y='Feature', data=feature_importance_df.head(20), ax=ax)
+                    ax.set_title('Top 20 Feature Importances')
+                    st.pyplot(fig)
+                else:
+                    st.info("Train the models first to view feature importances.")
+            else:
+                st.info("Train the models first to view feature importances.")
 
     elif selected_tab == "Data Overview":
         st.title("Data Overview")
@@ -277,10 +311,10 @@ def main():
         # Get selected features
         selected_features = st.session_state.get('selected_features', None)
         if selected_features is None:
-            # If variable selection not done, use all features except exclusions
+            # If transformation and selection not done, use all features except exclusions
             selected_features = list(set(df.columns.tolist()) - set(['codice_fiscale', 'note', 'città', target]))
             st.session_state['selected_features'] = selected_features
-            st.info("Using all features as no variable selection was performed.")
+            st.info("Using all features as no transformation and selection was performed.")
 
         # Preprocess data with selected features
         X, y = preprocess_data(df, target, selected_features)
@@ -302,7 +336,7 @@ def main():
         if 'original_num_samples' not in st.session_state:
             st.session_state['original_num_samples'] = len(df)
         
-        if n_samples != st.session_state['original_num_samples']:
+        if n_samples != st.session_state.get('original_num_samples', 1000):
             df = generate_data(int(n_samples))
             st.session_state['original_num_samples'] = n_samples
             st.sidebar.info(f"Data regenerated with {n_samples} samples.")
@@ -414,7 +448,7 @@ def main():
                 if isinstance(model, (RandomForestClassifier, GradientBoostingClassifier, xgb.XGBClassifier, StackingClassifier)):
                     explainer = shap.Explainer(model, X_train)
                 elif isinstance(model, LogisticRegression):
-                    explainer = shap.LinearExplainer(model, X_train)
+                    explainer = shap.LinearExplainer(model, X_train, feature_dependence="independent")
                 else:
                     explainer = shap.Explainer(model, X_train)
                 shap_values = explainer(X_test)
@@ -424,27 +458,41 @@ def main():
             except Exception as e:
                 st.error(f"SHAP Error: {e}")
 
-        # LIME Explanation
+        # LIME Explanation (Optional)
         st.subheader("LIME Explanation")
         with st.spinner("Generating LIME explanation..."):
             try:
-                explainer_lime = LimeTabularExplainer(
-                    X_train.values if X_train is not None else X_test.values,
-                    feature_names=X_test.columns.tolist(),
-                    class_names=['No', 'Yes'],
-                    mode='classification'
-                )
+                # Ensure that X_train is available
+                if X_train is None:
+                    st.error("Training data not available for LIME explanations.")
+                else:
+                    explainer_lime = LimeTabularExplainer(
+                        X_train.values,
+                        feature_names=X_train.columns.tolist(),
+                        class_names=['No', 'Yes'],
+                        mode='classification'
+                    )
 
-                idx = st.slider('Select Index for LIME Explanation', 0, len(X_test) - 1, 0)
-                exp = explainer_lime.explain_instance(X_test.iloc[idx].values, model.predict_proba, num_features=10)
-                fig, ax = plt.subplots(figsize=(10, 5))
-                exp.as_pyplot_figure(ax)
-                st.pyplot(fig)
+                    idx = st.slider('Select Index for LIME Explanation', 0, len(X_test) - 1, 0)
+                    exp = explainer_lime.explain_instance(X_test.iloc[idx].values, model.predict_proba, num_features=10)
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    exp.as_pyplot_figure(ax)
+                    st.pyplot(fig)
 
-                st.write("### LIME Explanation Details")
-                st.write(exp.as_list())
+                    st.write("### LIME Explanation Details")
+                    st.write(exp.as_list())
             except Exception as e:
                 st.error(f"LIME Error: {e}")
+
+        # Additional SHAP Plots (Optional)
+        st.subheader("SHAP Summary Plot")
+        with st.spinner("Generating SHAP summary plot..."):
+            try:
+                plt.figure(figsize=(10, 6))
+                shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+                st.pyplot(plt)
+            except Exception as e:
+                st.error(f"SHAP Summary Plot Error: {e}")
 
 if __name__ == "__main__":
     main()
