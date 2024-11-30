@@ -24,6 +24,7 @@ from sklearn.preprocessing import LabelEncoder
 from faker import Faker
 import warnings
 import xgboost as xgb
+import logging
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
@@ -81,6 +82,24 @@ def generate_data(num_samples):
     df['patrimonio'] = df['patrimonio'].apply(lambda x: x if x > 0 else 10000)
     return df
 
+# Initialize logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Define a custom handler that appends to a list in session state
+class StreamlitHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        if 'logs' not in st.session_state:
+            st.session_state['logs'] = []
+        st.session_state['logs'].append(log_entry)
+
+# Add the custom handler to the logger
+streamlit_handler = StreamlitHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+streamlit_handler.setFormatter(formatter)
+logger.addHandler(streamlit_handler)
+
 # Load data with caching
 @st.cache_data
 def load_data(uploaded_file, num_samples=1000):
@@ -88,16 +107,21 @@ def load_data(uploaded_file, num_samples=1000):
         try:
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
+                logger.info(f"Loaded data from CSV file: {uploaded_file.name}")
             elif uploaded_file.name.endswith(('.xls', '.xlsx')):
                 df = pd.read_excel(uploaded_file)
+                logger.info(f"Loaded data from Excel file: {uploaded_file.name}")
             else:
                 st.error("Unsupported file format. Please upload a CSV or Excel file.")
                 df = generate_data(num_samples)
+                logger.warning("Unsupported file format uploaded. Generated synthetic data.")
         except Exception as e:
             st.error(f"Error loading data: {e}")
             df = generate_data(num_samples)
+            logger.error(f"Error loading data: {e}. Generated synthetic data.")
     else:
         df = generate_data(num_samples)
+        logger.info("No file uploaded. Generated synthetic data.")
     return df
 
 # Preprocess data function with Label Encoding
@@ -114,20 +138,25 @@ def preprocess_data(df, target_column, selected_features=None):
         X (pd.DataFrame): Processed features.
         y (pd.Series): Target variable.
     """
+    logger.info("Starting data preprocessing.")
     # If no features are selected, use all columns except the target and known exclusions
     if selected_features is None:
         selected_features = df.columns.tolist()
         selected_features = list(set(selected_features) - set(['codice_fiscale', 'note', 'città', target_column]))
+        logger.info("No selected features provided. Using all available features except exclusions.")
 
     # Ensure selected_features are in the dataframe
     selected_features = [feature for feature in selected_features if feature in df.columns]
+    logger.info(f"Selected features: {selected_features}")
 
     # Drop columns not in selected features
     drop_cols = set(df.columns) - set(selected_features) - {target_column}
     features = df.drop(columns=drop_cols)
+    logger.info(f"Dropped columns: {drop_cols}")
 
     # Identify categorical columns
     categorical_cols = features.select_dtypes(include=['object', 'bool']).columns.tolist()
+    logger.info(f"Categorical columns identified for Label Encoding: {categorical_cols}")
 
     # Apply Label Encoding to categorical columns
     label_encoders = {}
@@ -135,14 +164,16 @@ def preprocess_data(df, target_column, selected_features=None):
         le = LabelEncoder()
         features[col] = le.fit_transform(features[col])
         label_encoders[col] = le  # Store the encoder if needed later
+        logger.info(f"Applied Label Encoding to column: {col}")
 
     X = features
     y = df[target_column].astype(int)
-
+    logger.info("Data preprocessing completed.")
     return X, y
 
 # Function to train models
 def train_models(X_train, y_train):
+    logger.info("Starting training of models...")
     models = {
         'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
         'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
@@ -151,8 +182,12 @@ def train_models(X_train, y_train):
     }
 
     for name, model in models.items():
+        logger.info(f"Training {name}...")
         model.fit(X_train, y_train)
+        logger.info(f"{name} trained successfully.")
 
+    # Stacking Classifier
+    logger.info("Training Stacking Classifier...")
     estimators = [
         ('rf', models['Random Forest']),
         ('gb', models['Gradient Boosting']),
@@ -165,14 +200,18 @@ def train_models(X_train, y_train):
         cv=5
     )
     stacking_model.fit(X_train, y_train)
+    logger.info("Stacking Classifier trained successfully.")
     models['Stacking Classifier'] = stacking_model
 
+    logger.info("All models trained successfully.")
     return models
 
 # Function to evaluate models
 def evaluate_models(models, X_test, y_test):
+    logger.info("Starting evaluation of models.")
     evaluation = {}
     for name, model in models.items():
+        logger.info(f"Evaluating {name}...")
         y_pred = model.predict(X_test)
         if hasattr(model, "predict_proba"):
             y_proba = model.predict_proba(X_test)[:,1]
@@ -191,6 +230,8 @@ def evaluate_models(models, X_test, y_test):
             'tpr': tpr,
             'thresholds': thresholds
         }
+        logger.info(f"{name} evaluated successfully.")
+    logger.info("All models evaluated successfully.")
     return evaluation
 
 # Main Streamlit App
@@ -214,6 +255,10 @@ def main():
         st.sidebar.success(f"Uploaded file: {uploaded_file.name}")
     else:
         st.sidebar.info("No file uploaded. Using generated data.")
+
+    # Initialize logs in session state
+    if 'logs' not in st.session_state:
+        st.session_state['logs'] = []
 
     # Transformation and Selection
     if selected_tab == "Transformation and Selection":
@@ -241,24 +286,21 @@ def main():
 
             # Apply Feature Importance using XGBoost to suggest relevant features
             st.subheader("Feature Importance using XGBoost")
-            if 'X_train' in st.session_state and 'models' in st.session_state:
-                model = st.session_state['models'].get('XGBoost')
-                if model:
-                    importances = model.feature_importances_
-                    feature_importance_df = pd.DataFrame({
-                        'Feature': X_all.columns,
-                        'Importance': importances
-                    }).sort_values(by='Importance', ascending=False)
+            if 'models' in st.session_state and 'XGBoost' in st.session_state['models']:
+                model = st.session_state['models']['XGBoost']
+                importances = model.feature_importances_
+                feature_importance_df = pd.DataFrame({
+                    'Feature': X_all.columns,
+                    'Importance': importances
+                }).sort_values(by='Importance', ascending=False)
 
-                    st.write(feature_importance_df)
+                st.write(feature_importance_df)
 
-                    # Plot Feature Importances
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    sns.barplot(x='Importance', y='Feature', data=feature_importance_df.head(20), ax=ax)
-                    ax.set_title('Top 20 Feature Importances')
-                    st.pyplot(fig)
-                else:
-                    st.info("Train the models first to view feature importances.")
+                # Plot Feature Importances
+                fig, ax = plt.subplots(figsize=(10, 6))
+                sns.barplot(x='Importance', y='Feature', data=feature_importance_df.head(20), ax=ax)
+                ax.set_title('Top 20 Feature Importances')
+                st.pyplot(fig)
             else:
                 st.info("Train the models first to view feature importances.")
 
@@ -335,13 +377,14 @@ def main():
         # Update dataset size if user changes
         if 'original_num_samples' not in st.session_state:
             st.session_state['original_num_samples'] = len(df)
-        
+
         if n_samples != st.session_state.get('original_num_samples', 1000):
             df = generate_data(int(n_samples))
             st.session_state['original_num_samples'] = n_samples
             st.sidebar.info(f"Data regenerated with {n_samples} samples.")
             X, y = preprocess_data(df, target, selected_features)
             st.session_state['selected_features'] = selected_features
+            logger.info(f"Data regenerated with {n_samples} samples.")
 
         # Split the data
         X_train, X_test, y_train, y_test = train_test_split(
@@ -351,17 +394,27 @@ def main():
         st.write(f"Training Samples: {X_train.shape[0]}")
         st.write(f"Testing Samples: {X_test.shape[0]}")
 
-        # Train models
+        # Initialize logs
+        st.session_state['logs'] = []
+        log_placeholder = st.empty()
+
+        # Function to display logs
+        def display_logs():
+            with log_placeholder.container():
+                st.text_area("Logs", value="\n".join(st.session_state['logs']), height=300)
+
+        # Train models and capture logs
         with st.spinner("Training models..."):
             models = train_models(X_train, y_train)
-        st.success("Models trained successfully!")
+            st.success("Models trained successfully!")
+            st.session_state['models'] = models
+            st.session_state['X_test'] = X_test
+            st.session_state['y_test'] = y_test
+            st.session_state['X_train'] = X_train
+            st.session_state['y_train'] = y_train
 
-        # Store models and data in session state for later use
-        st.session_state['models'] = models
-        st.session_state['X_test'] = X_test
-        st.session_state['y_test'] = y_test
-        st.session_state['X_train'] = X_train
-        st.session_state['y_train'] = y_train
+        # Display logs
+        display_logs()
 
     elif selected_tab == "Model Evaluation":
         st.title("Model Evaluation")
@@ -458,7 +511,7 @@ def main():
             except Exception as e:
                 st.error(f"SHAP Error: {e}")
 
-        # LIME Explanation (Optional)
+        # LIME Explanation
         st.subheader("LIME Explanation")
         with st.spinner("Generating LIME explanation..."):
             try:
@@ -494,5 +547,5 @@ def main():
             except Exception as e:
                 st.error(f"SHAP Summary Plot Error: {e}")
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
